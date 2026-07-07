@@ -7,18 +7,23 @@ import Foundation
 @MainActor
 @Observable
 final class NexusCentralManager: NSObject {
+    private static let pairedIdentifiersDefaultsKey = "NexusCentralManager.pairedIdentifiers"
+
     private var central: CBCentralManager!
     private(set) var bluetoothState: CBManagerState = .unknown
     private(set) var devices: [UUID: CoreDeviceState] = [:]
 
     private var peripherals: [UUID: CBPeripheral] = [:]
     private var requestCharacteristics: [UUID: CBCharacteristic] = [:]
+    private var pairedIdentifiers: Set<UUID>
 
     var orderedDevices: [CoreDeviceState] {
         devices.values.sorted { $0.displayName < $1.displayName }
     }
 
     override init() {
+        let stored = UserDefaults.standard.stringArray(forKey: Self.pairedIdentifiersDefaultsKey) ?? []
+        pairedIdentifiers = Set(stored.compactMap(UUID.init))
         super.init()
         central = CBCentralManager(delegate: self, queue: .main)
     }
@@ -37,6 +42,41 @@ final class NexusCentralManager: NSObject {
 
     func stopScanning() {
         central.stopScan()
+    }
+
+    /// Explicitly connect to a discovered device (e.g. the user tapping it in
+    /// the device list). Also invoked automatically for already-paired
+    /// devices as soon as they're (re)discovered.
+    func connect(_ id: UUID) {
+        guard let peripheral = peripherals[id], let device = devices[id] else { return }
+        guard device.phase == .discovered || device.phase == .disconnected else { return }
+        device.phase = .connecting
+        central.connect(peripheral, options: nil)
+    }
+
+    /// User-initiated disconnect. Also unpairs the device so it doesn't
+    /// immediately auto-reconnect the next time it's (re)discovered.
+    func disconnect(_ id: UUID) {
+        guard let peripheral = peripherals[id] else { return }
+        unpair(id)
+        central.cancelPeripheralConnection(peripheral)
+    }
+
+    private func markPaired(_ id: UUID) {
+        guard pairedIdentifiers.insert(id).inserted else { return }
+        UserDefaults.standard.set(
+            pairedIdentifiers.map(\.uuidString),
+            forKey: Self.pairedIdentifiersDefaultsKey
+        )
+    }
+
+    private func unpair(_ id: UUID) {
+        guard pairedIdentifiers.remove(id) != nil else { return }
+        UserDefaults.standard.set(
+            pairedIdentifiers.map(\.uuidString),
+            forKey: Self.pairedIdentifiersDefaultsKey
+        )
+        devices[id]?.isPaired = false
     }
 }
 
@@ -58,10 +98,11 @@ extension NexusCentralManager: CBCentralManagerDelegate {
 
         if let existing = devices[id] {
             existing.rssi = RSSI.intValue
+            if pairedIdentifiers.contains(id) {
+                connect(id)
+            }
             return
         }
-
-        guard devices.count < NexusProtocol.maxConnectedPeripherals else { return }
 
         let name = (advertisementData[CBAdvertisementDataLocalNameKey] as? String)
             ?? peripheral.name
@@ -71,20 +112,20 @@ extension NexusCentralManager: CBCentralManagerDelegate {
 
         let device = CoreDeviceState(id: id, displayName: name)
         device.rssi = RSSI.intValue
+        device.isPaired = pairedIdentifiers.contains(id)
         devices[id] = device
         peripherals[id] = peripheral
         peripheral.delegate = self
 
-        device.phase = .connecting
-        central.connect(peripheral, options: nil)
-
-        if devices.count == NexusProtocol.maxConnectedPeripherals {
-            stopScanning()
+        if device.isPaired {
+            connect(id)
         }
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         guard let device = devices[peripheral.identifier] else { return }
+        markPaired(peripheral.identifier)
+        device.isPaired = true
         device.phase = .discoveringServices
         peripheral.discoverServices([NexusProtocol.serviceUUID])
     }
@@ -107,7 +148,11 @@ extension NexusCentralManager: CBCentralManagerDelegate {
         guard let device = devices[peripheral.identifier] else { return }
         device.phase = .disconnected
         device.lastError = error?.localizedDescription
-        central.connect(peripheral, options: nil)
+        // Only auto-reconnect if still paired: a user-initiated disconnect()
+        // unpairs first specifically to prevent this from undoing it.
+        if pairedIdentifiers.contains(peripheral.identifier) {
+            central.connect(peripheral, options: nil)
+        }
     }
 }
 

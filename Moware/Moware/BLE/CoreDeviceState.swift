@@ -9,6 +9,30 @@ enum CoreConnectionPhase: Equatable {
     case requestingStream
     case streaming
     case disconnected
+
+    var description: String {
+        switch self {
+        case .discovered: "Discovered"
+        case .connecting: "Connecting…"
+        case .discoveringServices: "Discovering services…"
+        case .discoveringCharacteristics: "Discovering characteristics…"
+        case .subscribing: "Subscribing…"
+        case .requestingStream: "Requesting stream…"
+        case .streaming: "Streaming"
+        case .disconnected: "Disconnected"
+        }
+    }
+
+    /// True once CoreBluetooth has an established connection to the
+    /// peripheral (post `didConnect`), regardless of GATT setup progress.
+    var isConnected: Bool {
+        switch self {
+        case .discoveringServices, .discoveringCharacteristics, .subscribing, .requestingStream, .streaming:
+            true
+        case .discovered, .connecting, .disconnected:
+            false
+        }
+    }
 }
 
 /// Per-peripheral state, keyed by `CBPeripheral.identifier`. Kept around
@@ -27,6 +51,7 @@ final class CoreDeviceState: Identifiable {
     private(set) var packetRateBySource: [UInt8: Double] = [:]
     var framesReceived: Int = 0
     var rssi: Int?
+    var isPaired: Bool = false
 
     private var receiveTimestampsBySource: [UInt8: [Date]] = [:]
 

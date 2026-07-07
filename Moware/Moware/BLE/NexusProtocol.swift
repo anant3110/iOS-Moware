@@ -7,8 +7,6 @@ enum NexusProtocol {
     static let responseCharacteristicUUID = CBUUID(string: "EA902002-9196-4499-8E9F-0BAA5772AEC1")
 
     static let advertisedNamePrefix = "UltraCore"
-
-    static let maxConnectedPeripherals = 2
 }
 
 /// Mirrors the firmware's `core_mode_t` opcode values, written to the
