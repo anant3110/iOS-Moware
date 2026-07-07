@@ -6,6 +6,10 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		AFB0C6794C6C34032B72DBF5 /* GLTFKit2 in Frameworks */ = {isa = PBXBuildFile; productRef = 69AAFE8C65F2C7F6BF0A2CBB /* GLTFKit2 */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		638337832FFC219E00C99703 /* Moware.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Moware.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -23,6 +27,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				AFB0C6794C6C34032B72DBF5 /* GLTFKit2 in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -65,6 +70,7 @@
 			);
 			name = Moware;
 			packageProductDependencies = (
+				69AAFE8C65F2C7F6BF0A2CBB /* GLTFKit2 */,
 			);
 			productName = Moware;
 			productReference = 638337832FFC219E00C99703 /* Moware.app */;
@@ -94,6 +100,9 @@
 			);
 			mainGroup = 6383377A2FFC219D00C99703;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				523FBA7C2EB4D9EB93844929 /* XCRemoteSwiftPackageReference "GLTFKit2" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 638337842FFC219E00C99703 /* Products */;
 			projectDirPath = "";
@@ -349,6 +358,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		523FBA7C2EB4D9EB93844929 /* XCRemoteSwiftPackageReference "GLTFKit2" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/warrenm/GLTFKit2.git";
+			requirement = {
+				kind = exactVersion;
+				version = 0.5.15;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		69AAFE8C65F2C7F6BF0A2CBB /* GLTFKit2 */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 523FBA7C2EB4D9EB93844929 /* XCRemoteSwiftPackageReference "GLTFKit2" */;
+			productName = GLTFKit2;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 6383377B2FFC219D00C99703 /* Project object */;
 }

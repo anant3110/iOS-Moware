@@ -12,6 +12,7 @@ final class NexusCentralManager: NSObject {
     private var central: CBCentralManager!
     private(set) var bluetoothState: CBManagerState = .unknown
     private(set) var devices: [UUID: CoreDeviceState] = [:]
+    let bodyFrameAssembler = BodyFrameAssembler()
 
     private var peripherals: [UUID: CBPeripheral] = [:]
     private var requestCharacteristics: [UUID: CBCharacteristic] = [:]
@@ -127,6 +128,7 @@ extension NexusCentralManager: CBCentralManagerDelegate {
         markPaired(peripheral.identifier)
         device.isPaired = true
         device.phase = .discoveringServices
+        bodyFrameAssembler.resetCalibration(for: peripheral.identifier)
         peripheral.discoverServices([NexusProtocol.serviceUUID])
     }
 
@@ -250,7 +252,9 @@ extension NexusCentralManager: CBPeripheralDelegate {
         guard let data = characteristic.value else { return }
 
         do {
-            device.apply(try TelemetryFrameDecoder.decode(data))
+            let frame = try TelemetryFrameDecoder.decode(data)
+            device.apply(frame)
+            bodyFrameAssembler.ingest(frame, deviceID: peripheral.identifier)
         } catch {
             device.lastError = "\(error)"
         }

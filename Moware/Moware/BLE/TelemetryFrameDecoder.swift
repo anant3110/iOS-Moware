@@ -11,7 +11,7 @@ enum TelemetryDecodeError: Error {
 ///
 /// ```c
 /// typedef struct {
-///     uint8_t timestamp[4];      // uint32 little-endian
+///     uint8_t timestamp[4];      // uint32 big-endian (byte[0] = (timestamp >> 24) & 0xFF)
 ///     uint8_t offset[15];
 ///     uint8_t source[15];
 ///     uint8_t data[13 * 15];     // 15 frames x 13-byte bit-packed sample
@@ -33,10 +33,10 @@ enum TelemetryFrameDecoder {
         }
         let bytes = [UInt8](data.dropFirst())
 
-        let timestamp = UInt32(bytes[0])
-            | (UInt32(bytes[1]) << 8)
-            | (UInt32(bytes[2]) << 16)
-            | (UInt32(bytes[3]) << 24)
+        let timestamp = (UInt32(bytes[0]) << 24)
+            | (UInt32(bytes[1]) << 16)
+            | (UInt32(bytes[2]) << 8)
+            | UInt32(bytes[3])
 
         let offsets = Array(bytes[4..<19])
         let sources = Array(bytes[19..<34])

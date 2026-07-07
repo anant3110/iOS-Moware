@@ -28,7 +28,7 @@ struct RawIMUSample: Sendable {
 /// One decoded 229-byte notification from the Nexus response characteristic,
 /// aggregating 15 I2C frames.
 struct SourceTimeStreamFrame: Sendable {
-    /// uint32, little-endian, timestamp of the first of the 15 I2C frames.
+    /// uint32, big-endian, timestamp of the first of the 15 I2C frames.
     let baseTimestamp: UInt32
     let samples: [RawIMUSample]
 

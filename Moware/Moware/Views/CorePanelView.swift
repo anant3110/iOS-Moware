@@ -7,7 +7,10 @@ struct CorePanelView: View {
         VStack(alignment: .leading, spacing: 8) {
             ForEach(device.latestSampleBySource.keys.sorted(), id: \.self) { sourceIndex in
                 if let sample = device.latestSampleBySource[sourceIndex] {
-                    SourceCard(sample: sample, packetsPerSecond: device.packetRateBySource[sourceIndex] ?? 0)
+                    SourceCard(
+                        sample: sample,
+                        detail: String(format: "%.0f pkt/s", device.packetRateBySource[sourceIndex] ?? 0)
+                    )
                 }
             }
 
@@ -23,9 +26,9 @@ struct CorePanelView: View {
     }
 }
 
-private struct SourceCard: View {
-    let sample: RawIMUSample
-    let packetsPerSecond: Double
+struct SourceCard: View {
+    let sample: any IMUReadable
+    let detail: String
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -33,7 +36,7 @@ private struct SourceCard: View {
                 Text("Source \(sample.sourceIndex)")
                     .font(.caption.bold())
                 Spacer()
-                Text(String(format: "%.0f pkt/s", packetsPerSecond))
+                Text(detail)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }

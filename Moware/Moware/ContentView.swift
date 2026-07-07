@@ -37,6 +37,10 @@ struct ContentView: View {
                                 CorePanelView(device: device)
                             }
                         }
+
+                        AvatarView(assembler: manager.bodyFrameAssembler)
+
+                        BodyFrameView(assembler: manager.bodyFrameAssembler)
                     }
                     .padding()
                 }

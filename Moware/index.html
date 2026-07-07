@@ -1,0 +1,863 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>3D Model Viewer</title>
+    <style>
+        body { 
+            margin: 0; 
+            padding: 0;
+            overflow: hidden; 
+            width: 100vw;
+            height: 100vh;
+        }
+        canvas { 
+            display: block;
+            width: 100%;
+            height: 100%;
+            position: absolute;
+            top: 0;
+            left: 0;
+        }
+    </style>
+</head>
+<body>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.158.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.158.0/examples/jsm/"
+            }
+        }
+    </script>
+    
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        let camera, scene, renderer, controls, mixer, clock;
+        let ybotModel = null;
+        let skeleton = null;
+        let boneMap = {}; // Maps source IDs to bone objects
+        let bindPoseLocal = {}; // Local quaternions in bind pose
+        let bindPoseGlobal = {}; // World quaternions in bind pose
+        let calibrationRotations = {}; // Binding offset: transforms T-pose sensor orientation to bind pose bone orientation (no gravity correction)
+        let calibrationInverses = {}; // Not currently used (reserved for future gravity alignment)
+        let isCalibrated = false;
+        
+        // Performance tracking
+        let lastFrameTime = 0;
+        let frameProcessing = false; // Prevent concurrent frame processing
+        
+        // === SKELETON HIERARCHY ===
+        // Source ID to bone name mapping (mixamorig* naming from YBot.fbx)
+        // With source remapping applied:
+        // 0→3, 1→2, 2→1, 3→0, 5→8, 6→7, 7→6, 8→5
+        const BONE_MAPPING = {
+            0: "mixamorigRightArm",      // Source 0 remapped to 2 → Right Arm Upper
+            1: "mixamorigRightForeArm",  // Source 1 remapped to 3 → Right Forearm
+            2: "mixamorigLeftArm",       // Source 2 remapped to 0 → Left Arm Upper
+            3: "mixamorigLeftForeArm",   // Source 3 remapped to 1 → Left Forearm
+            4: "mixamorigSpine2",        // Upper Torso (no remapping)
+            5: "mixamorigRightUpLeg",    // Source 5 remapped to 7 → Right Leg Upper
+            6: "mixamorigRightLeg",      // Source 6 remapped to 8 → Right Leg Lower
+            7: "mixamorigLeftUpLeg",     // Source 7 remapped to 5 → Left Leg Upper
+            8: "mixamorigLeftLeg",       // Source 8 remapped to 6 → Left Leg Lower
+            9: "mixamorigHips"           // Hip (ROOT, no remapping)
+        };
+        
+        // Processing order: PARENT FIRST, then children (for correct bone transforms)
+        // Root → torso → intermediate bones → leaf bones
+        const HIERARCHY_ORDER = [9, 4, 5, 7, 0, 2, 1, 3, 6, 8];
+        
+        // Parent mapping for each source (with remapping applied)
+        const PARENT_MAP = {
+            0: 4,  // Source 0 (Right Arm) → Torso
+            1: 0,  // Source 1 (Right Forearm) → Right Arm Upper (source 0)
+            2: 4,  // Source 2 (Left Arm) → Torso
+            3: 2,  // Source 3 (Left Forearm) → Left Arm Upper (source 2)
+            4: 9,  // Torso → Hip
+            5: 9,  // Source 5 (Right Leg Upper) → Hip
+            6: 5,  // Source 6 (Right Leg Lower) → Right Leg Upper (source 5)
+            7: 9,  // Source 7 (Left Leg Upper) → Hip
+            8: 7,  // Source 8 (Left Leg Lower) → Left Leg Upper (source 7)
+            9: null // Hip is root (no parent)
+        };
+        
+        // === HELPER FUNCTIONS ===
+        
+        /**
+         * Get world quaternion from a Three.js bone
+         */
+        function getWorldQuaternion(bone) {
+            const worldQuat = new THREE.Quaternion();
+            bone.getWorldQuaternion(worldQuat);
+            return worldQuat;
+        }
+        
+        /**
+         * Parse and remap gravity vector based on source ID
+         * This applies the correct axis transformation based on physical sensor mounting
+         * @param {Array} gravity - Raw gravity vector [x, y, z] from sensor
+         * @param {number} source - Source ID (0-9)
+         * @returns {Array} Remapped gravity vector [x, y, z]
+         */
+        function parseGravity(gravity, source) {
+            const [x, y, z] = gravity;
+            
+            // Apply transformation matching the quaternion axes
+            // REVERSED: Left/Right swapped
+            switch (source) {
+                case 0: return [-y, -z, -x];   // Right arm upper (was left, now right)
+                case 1: return [-y, -z, -x];   // Right forearm (was left, now right)
+                case 2: return [x, y, z]; // Left arm upper (was right, now left)
+                case 3: return [x, y, z]; // Left forearm (was right, now left)
+                case 4: return [x, y, z];   // Chest (unchanged)
+                case 5: return [z, y, -x];  // Right lower leg (was left, now right)
+                case 6: return [z, y, -x];  // Right upper leg (was left, now right)
+                case 7: return [-z, y, x];  // Left lower leg (was right, now left)
+                case 8: return [-z, y, x];  // Left upper leg (was right, now left)
+                case 9: return [x, y, z];   // Hip (unchanged)
+                default: return [0, 0, 1];   // Default gravity pointing down
+            }
+        }
+        
+        /**
+         * Parse and remap linear acceleration based on source ID
+         * This applies the correct axis transformation based on physical sensor mounting
+         * @param {Array} linearAcceleration - Raw linear acceleration [x, y, z] from sensor
+         * @param {number} source - Source ID (0-9)
+         * @returns {Array} Remapped linear acceleration [x, y, z]
+         */
+        function parseLinearAcceleration(linearAcceleration, source) {
+            const [x, y, z] = linearAcceleration;
+            
+            // Apply transformation matching the quaternion axes
+            // REVERSED: Left/Right swapped
+            switch (source) {
+                case 0: return [y, -z, x];   // Right arm upper (was left, now right)
+                case 1: return [y, -z, x];   // Right forearm (was left, now right)
+                case 2: return [-y, -z, -x]; // Left arm upper (was right, now left)
+                case 3: return [-y, -z, -x]; // Left forearm (was right, now left)
+                case 4: return [x, y, -z];   // Chest (unchanged)
+                case 5: return [z, -y, -x];  // Right lower leg (was left, now right)
+                case 6: return [z, -y, -x];  // Right upper leg (was left, now right)
+                case 7: return [-z, -y, x];  // Left lower leg (was right, now left)
+                case 8: return [-z, -y, x];  // Left upper leg (was right, now left)
+                case 9: return [x, y, -z];   // Hip (unchanged)
+                default: return [0, 0, 1];   // Default
+            }
+        }
+        
+        /**
+         * Parse and remap quaternion based on source ID
+         * This applies the correct axis transformation based on physical sensor mounting
+         * @param {Array} quaternion - Raw quaternion [x, y, z, w] from sensor
+         * @param {number} source - Source ID (0-9)
+         * @returns {Array} Remapped quaternion [x, y, z, w]
+         */
+        function parseQuaternion(quaternion, source) {
+            const [x, y, z, w] = quaternion;
+            
+            // Apply transformation based on target bone (after remapping)
+            // REVERSED: Left/Right swapped
+            switch (source) {
+                case 0: return [-y, -z, -x, -w];     // Right arm (was left, now right)
+                case 1: return [-y, -z, -x, -w];     // Right forearm (was left, now right)
+                case 2: return [x, y, z, w];   // Left arm (was right, now left)
+                case 3: return [x, y, z, w];   // Left forearm (was right, now left)
+                case 4: return [x, y, z, w];     // Chest (unchanged)
+                case 5: return [z, y, -x, w];     // Right lower leg - Try matching chest/hip axes
+                case 6: return [z, y, -x, w];     // Right upper leg - Try matching chest/hip axes
+                case 7: return [-z, y, x, w];     // Left lower leg - Try matching chest/hip axes
+                case 8: return [-z, y, x, w];     // Left upper leg - Try matching chest/hip axes
+                case 9: return [x, y, z, w];     // Hip (unchanged)
+                default: return [0, 0, 0, 1]; // Identity quaternion
+            }
+        }
+        
+        /**
+         * Convert sensor quaternion [i, j, k, w] to Three.js Quaternion
+         * Sensor format: [qi, qj, qk, qw]
+         * Three.js format: Quaternion(x, y, z, w)
+         */
+        function sensorQuatToThree(q) {
+            const quat = new THREE.Quaternion(q[0], q[1], q[2], q[3]);
+            
+            // Normalize to ensure unit quaternion (prevents scaling artifacts)
+            const length = Math.sqrt(quat.x * quat.x + quat.y * quat.y + quat.z * quat.z + quat.w * quat.w);
+            
+            // Only warn if significantly non-unit (> 5% deviation)
+            // Small deviations are normal due to floating-point precision
+            if (Math.abs(length - 1.0) > 0.05) {
+                console.warn(`Significantly non-unit quaternion! Length: ${length.toFixed(4)}, input: [${q[0].toFixed(3)}, ${q[1].toFixed(3)}, ${q[2].toFixed(3)}, ${q[3].toFixed(3)}]`);
+            }
+            
+            // Always normalize to be safe
+            quat.normalize();
+            
+            return quat;
+        }
+        
+        /**
+         * Apply global quaternion to bone (convert to local space)
+         */
+        function applyGlobalQuaternionToBone(bone, globalQuat) {
+            if (!bone || !globalQuat) return;
+            
+            // CRITICAL: Never modify bone.scale - only bone.quaternion
+            // Scale modifications cause the "scaling" visual artifact
+            
+            // If bone has a parent, convert global to local
+            if (bone.parent && bone.parent.isBone) {
+                const parentWorldQuat = new THREE.Quaternion();
+                bone.parent.getWorldQuaternion(parentWorldQuat);
+                
+                // localQuat = parentWorldQuat^-1 × globalQuat
+                const parentInverse = parentWorldQuat.clone().invert();
+                const localQuat = new THREE.Quaternion();
+                localQuat.multiplyQuaternions(parentInverse, globalQuat);
+                localQuat.normalize(); // Ensure unit quaternion
+                
+                // ONLY set quaternion, NEVER touch position or scale
+                bone.quaternion.copy(localQuat);
+            } else {
+                // Root bone, use global quaternion directly
+                globalQuat.normalize(); // Ensure unit quaternion
+                bone.quaternion.copy(globalQuat);
+            }
+        }
+        
+        /**
+         * Extract skeleton from loaded model
+         */
+        function extractSkeleton() {
+            if (!ybotModel) {
+                console.error('Model not loaded');
+                return false;
+            }
+            
+            // Log all available bone names first
+            console.log('=== SCANNING MODEL FOR BONES ===');
+            ybotModel.traverse((child) => {
+                if (child.isSkinnedMesh && child.skeleton) {
+                    console.log('Found skeleton with', child.skeleton.bones.length, 'bones:');
+                    child.skeleton.bones.forEach((bone, idx) => {
+                        console.log(`  [${idx}] ${bone.name}`);
+                    });
+                    skeleton = child.skeleton;
+                }
+            });
+            
+            if (!skeleton) {
+                console.error('No skeleton found in model');
+                return false;
+            }
+            
+            // Map source IDs to bones and store bind pose
+            console.log('=== MAPPING BONES ===');
+            HIERARCHY_ORDER.forEach(sourceId => {
+                const boneName = BONE_MAPPING[sourceId];
+                const bone = skeleton.bones.find(b => b.name === boneName);
+                
+                if (bone) {
+                    boneMap[sourceId] = bone;
+                    
+                    // Store bind pose (local and global quaternions)
+                    bindPoseLocal[sourceId] = bone.quaternion.clone();
+                    bindPoseGlobal[sourceId] = getWorldQuaternion(bone);
+                    
+                    console.log(`✓ Source ${sourceId} → ${boneName}`);
+                    console.log(`  Local: [${bone.quaternion.x.toFixed(3)}, ${bone.quaternion.y.toFixed(3)}, ${bone.quaternion.z.toFixed(3)}, ${bone.quaternion.w.toFixed(3)}]`);
+                } else {
+                    console.warn(`✗ Bone "${boneName}" NOT FOUND for source ${sourceId}`);
+                }
+            });
+            
+            const mappedCount = Object.keys(boneMap).length;
+            console.log(`Skeleton extracted: ${mappedCount}/${HIERARCHY_ORDER.length} bones mapped`);
+            
+            // Print local axes for debugging
+            if (mappedCount > 0) {
+                console.log('\n');
+                window.printLimbAxes();
+            }
+            
+            return mappedCount > 0;
+        }
+        
+        /**
+         * Reset calibration state
+         */
+        function resetCalibration() {
+            calibrationRotations = {};
+            calibrationInverses = {};
+            isCalibrated = false;
+            console.log('Calibration reset');
+        }
+        
+        /**
+         * Print local axes of each mapped limb (call from console or after skeleton extraction)
+         */
+        window.printLimbAxes = function() {
+            if (!skeleton || Object.keys(boneMap).length === 0) {
+                console.error('Skeleton not loaded or bones not mapped');
+                return;
+            }
+            
+            console.log('=== GLOBAL (WORLD-SPACE) AXES OF EACH LIMB ===');
+            HIERARCHY_ORDER.forEach(sourceId => {
+                const bone = boneMap[sourceId];
+                if (!bone) {
+                    console.warn(`Source ${sourceId}: No bone mapped`);
+                    return;
+                }
+                
+                const boneName = BONE_MAPPING[sourceId];
+                
+                // Get bone's GLOBAL (world-space) quaternion
+                const globalQuat = new THREE.Quaternion();
+                bone.getWorldQuaternion(globalQuat);
+                
+                // Create unit axis vectors
+                const globalX = new THREE.Vector3(1, 0, 0);
+                const globalY = new THREE.Vector3(0, 1, 0);
+                const globalZ = new THREE.Vector3(0, 0, 1);
+                
+                // Apply world quaternion to get bone's global axis directions
+                globalX.applyQuaternion(globalQuat);
+                globalY.applyQuaternion(globalQuat);
+                globalZ.applyQuaternion(globalQuat);
+                
+                console.log(`\nSource ${sourceId}: ${boneName}`);
+                console.log(`  Global Quaternion: [${globalQuat.x.toFixed(3)}, ${globalQuat.y.toFixed(3)}, ${globalQuat.z.toFixed(3)}, ${globalQuat.w.toFixed(3)}]`);
+                console.log(`  Global X-axis: [${globalX.x.toFixed(3)}, ${globalX.y.toFixed(3)}, ${globalX.z.toFixed(3)}]`);
+                console.log(`  Global Y-axis: [${globalY.x.toFixed(3)}, ${globalY.y.toFixed(3)}, ${globalY.z.toFixed(3)}]`);
+                console.log(`  Global Z-axis: [${globalZ.x.toFixed(3)}, ${globalZ.y.toFixed(3)}, ${globalZ.z.toFixed(3)}]`);
+                
+                // Get world position
+                const worldPos = new THREE.Vector3();
+                bone.getWorldPosition(worldPos);
+                console.log(`  World Position: [${worldPos.x.toFixed(3)}, ${worldPos.y.toFixed(3)}, ${worldPos.z.toFixed(3)}]`);
+            });
+            
+            console.log('\n=== END GLOBAL AXES ===');
+        };
+        
+        /**
+         * Rotate model for testing (call from console)
+         * Usage: rotateModel(90) for 90 degrees, rotateModel(180) for 180 degrees
+         */
+        window.rotateModel = function(degrees) {
+            if (ybotModel) {
+                ybotModel.rotation.y = degrees * Math.PI / 180;
+                console.log(`Model rotated to ${degrees}° (${ybotModel.rotation.y.toFixed(3)} radians)`);
+            } else {
+                console.error('Model not loaded');
+            }
+        };
+        
+        /**
+         * Get current model rotation (call from console)
+         */
+        window.getModelRotation = function() {
+            if (ybotModel) {
+                const degrees = ybotModel.rotation.y * 180 / Math.PI;
+                console.log(`Current rotation: ${degrees.toFixed(1)}° (${ybotModel.rotation.y.toFixed(3)} radians)`);
+                console.log(`X: ${ybotModel.rotation.x.toFixed(3)}, Y: ${ybotModel.rotation.y.toFixed(3)}, Z: ${ybotModel.rotation.z.toFixed(3)}`);
+            } else {
+                console.error('Model not loaded');
+            }
+        };
+        
+        /**
+         * Process calibration frame (T-pose)
+         * Called from Kotlin via processCalibrationFrame(frameJson)
+         */
+        window.processCalibrationFrame = function(frameData) {
+            if (!skeleton) {
+                console.error('Skeleton not ready for calibration');
+                if (typeof window.AndroidBridge !== 'undefined') {
+                    window.AndroidBridge.onCalibrationComplete(false, 'Skeleton not initialized');
+                }
+                return;
+            }
+            
+            try {
+                console.log('Processing calibration frame (T-pose)...');
+                console.log('Frame data:', frameData);
+                console.log('Available sensors:', Object.keys(frameData.sensors));
+                
+                let successCount = 0;
+                let missingCount = 0;
+                
+                // Process each source in hierarchy order
+                HIERARCHY_ORDER.forEach(sourceId => {
+                    const sensorData = frameData.sensors[sourceId];
+                    if (!sensorData) {
+                        console.warn(`No sensor data for source ${sourceId} in calibration frame`);
+                        missingCount++;
+                        return;
+                    }
+                    
+                    const bone = boneMap[sourceId];
+                    if (!bone) {
+                        console.warn(`No bone mapped for source ${sourceId}`);
+                        return;
+                    }
+                    
+                    // Parse and remap raw sensor data based on physical mounting
+                    // DEBUG: Log raw quaternion BEFORE parseQuaternion
+                    const rawQuat = sensorData.q;
+                    const rawQuatMag = Math.sqrt(rawQuat[0]*rawQuat[0] + rawQuat[1]*rawQuat[1] + rawQuat[2]*rawQuat[2] + rawQuat[3]*rawQuat[3]);
+                    console.log(`Source ${sourceId} RAW quat from Kotlin: [${rawQuat[0].toFixed(3)}, ${rawQuat[1].toFixed(3)}, ${rawQuat[2].toFixed(3)}, ${rawQuat[3].toFixed(3)}] (mag: ${rawQuatMag.toFixed(3)})`);
+                    
+                    const parsedQuat = parseQuaternion(sensorData.q, sourceId);
+                    const parsedQuatMag = Math.sqrt(parsedQuat[0]*parsedQuat[0] + parsedQuat[1]*parsedQuat[1] + parsedQuat[2]*parsedQuat[2] + parsedQuat[3]*parsedQuat[3]);
+                    console.log(`Source ${sourceId} PARSED quat after remap: [${parsedQuat[0].toFixed(3)}, ${parsedQuat[1].toFixed(3)}, ${parsedQuat[2].toFixed(3)}, ${parsedQuat[3].toFixed(3)}] (mag: ${parsedQuatMag.toFixed(3)})`);
+                    
+                    const parsedGravity = parseGravity(sensorData.g, sourceId);
+                    
+                    // Convert parsed quaternion to Three.js format
+                    const sensorQuat = sensorQuatToThree(parsedQuat);
+                    
+                    // STEP 1: Compute Q_g for gravity correction (all sources)
+                    // Q_g = fromToRotation(gravityFromIMU, Vector.UP)
+                    let Q_g = null;
+                    let Q_tpose_imu_corrected = sensorQuat.clone();
+                    
+                    // Apply gravity correction to all sources (arms, legs, torso, hips)
+                    const gravityVec = new THREE.Vector3(parsedGravity[0], parsedGravity[1], parsedGravity[2]);
+                    gravityVec.normalize();
+                    
+                    const vectorUp = new THREE.Vector3(0, 1, 0);
+                    
+                    // Q_g rotates FROM gravity TO up
+                    Q_g = new THREE.Quaternion();
+                    Q_g.setFromUnitVectors(vectorUp, gravityVec);
+                    
+                    // Apply gravity correction as simple pre-multiplication
+                    // Q_tpose_imu_corrected = Q_g * Q_tpose_imu
+                    Q_tpose_imu_corrected = new THREE.Quaternion();
+                    Q_tpose_imu_corrected.multiplyQuaternions(Q_g, sensorQuat);
+                    Q_tpose_imu_corrected.multiplyQuaternions(sensorQuat, Q_g.clone().invert());
+                    Q_tpose_imu_corrected.normalize();
+                    
+                    let limbType = 'UNKNOWN';
+                    if (sourceId >= 0 && sourceId <= 3) limbType = 'ARM';
+                    else if (sourceId >= 5 && sourceId <= 8) limbType = 'LEG';
+                    else if (sourceId === 4) limbType = 'TORSO';
+                    else if (sourceId === 9) limbType = 'HIP';
+                    
+                    console.log(`  Source ${sourceId} (${limbType}): Q_g computed and applied to T-pose`);
+                    console.log(`    Gravity: [${parsedGravity[0].toFixed(3)}, ${parsedGravity[1].toFixed(3)}, ${parsedGravity[2].toFixed(3)}]`);
+                    
+                    // Calibration with gravity correction applied
+                    // calibrationPacket = Q_tpose_mixamo * inverse(Q_tpose_imu_corrected)
+                    const sensorQuatInverse = Q_tpose_imu_corrected.clone().invert();
+                    const calibrationPacket = new THREE.Quaternion();
+                    calibrationPacket.multiplyQuaternions(bindPoseGlobal[sourceId], sensorQuatInverse);
+                    calibrationPacket.normalize();
+                    
+                    // Store calibration packet and Q_g (for all sources)
+                    calibrationRotations[sourceId] = calibrationPacket;
+                    calibrationInverses[sourceId] = Q_g; // Store Q_g for all sources
+                    
+                    console.log(`  Binding offset computed for source ${sourceId}`);
+                    
+                    successCount++;
+                });
+                
+                console.log(`Calibration summary: ${successCount} sources calibrated, ${missingCount} missing`);
+                
+                isCalibrated = (successCount > 0);
+                console.log(`Calibration complete: ${isCalibrated}`);
+                
+                // DON'T apply quaternions - keep model in its natural bind pose (which is T-pose)
+                // The bind pose quaternions are already correct for T-pose
+                console.log('✓ Calibration complete - model remains in bind T-pose');
+                
+                if (typeof window.AndroidBridge !== 'undefined') {
+                    window.AndroidBridge.onCalibrationComplete(
+                        isCalibrated, 
+                        `${successCount}/${HIERARCHY_ORDER.length} sources calibrated`
+                    );
+                }
+            } catch (error) {
+                console.error('Calibration error:', error);
+                if (typeof window.AndroidBridge !== 'undefined') {
+                    window.AndroidBridge.onCalibrationComplete(false, error.message);
+                }
+            }
+        };
+        
+        /**
+         * Update motion frame (real-time animation)
+         * Called from Kotlin via updateMotionFrame(frameJson)
+         */
+        window.updateMotionFrame = function(frameData) {
+            if (!isCalibrated) {
+                // Log only once every 5 seconds to avoid spam
+                if (frameData.timestamp % 5000 < 50) {
+                    console.warn('Not calibrated yet, skipping motion frames. Strike T-pose first!');
+                }
+                return;
+            }
+            
+            if (!skeleton) return;
+            
+            // Frame dropping: Skip if previous frame is still being processed
+            if (frameProcessing) {
+                if (frameData.timestamp % 10000 < 50) {
+                    console.warn('Dropping frame - previous frame still processing');
+                }
+                return;
+            }
+            
+            frameProcessing = true;
+            
+            try {
+                // Compute calibrated GLOBAL quaternions for all sensors and apply directly
+                // GLOBAL MAPPING: Each sensor directly controls its bone's world-space orientation
+                let appliedCount = 0;
+                let skippedCount = 0;
+                
+                // CRITICAL: Capture all parent world quaternions BEFORE modifying any bones
+                // This prevents child bones from seeing parent's updated orientation
+                const parentWorldQuats = {};
+                HIERARCHY_ORDER.forEach(sourceId => {
+                    const bone = boneMap[sourceId];
+                    if (bone && bone.parent && bone.parent.isBone) {
+                        parentWorldQuats[sourceId] = new THREE.Quaternion();
+                        bone.parent.getWorldQuaternion(parentWorldQuats[sourceId]);
+                    }
+                });
+                
+                HIERARCHY_ORDER.forEach(sourceId => {
+                    const sensorData = frameData.sensors[sourceId];
+                    if (!sensorData || !calibrationRotations[sourceId]) {
+                        skippedCount++;
+                        return;
+                    }
+                    
+                    const bone = boneMap[sourceId];
+                    if (!bone) {
+                        skippedCount++;
+                        return;
+                    }
+                    
+                    // Parse and remap raw sensor data based on physical mounting
+                    const parsedQuat = parseQuaternion(sensorData.q, sourceId);
+                    const Q_streaming_imu = sensorQuatToThree(parsedQuat);
+                    
+                    // Apply gravity correction (if applicable) then calibration
+                    let Q_streaming_corrected = Q_streaming_imu.clone();
+                    
+                    if (calibrationInverses[sourceId]) {
+                        // Arms: Apply gravity correction as simple pre-multiplication
+                        // Q_streaming_corrected = Q_g * Q_streaming_imu
+                        const Q_g = calibrationInverses[sourceId];
+                        Q_streaming_corrected = new THREE.Quaternion();
+                        Q_streaming_corrected.multiplyQuaternions(Q_g, Q_streaming_imu);
+                        Q_streaming_corrected.multiplyQuaternions(Q_streaming_corrected, Q_g.clone().invert());
+                        Q_streaming_corrected.normalize();
+                    }
+                    
+                    // Apply calibration packet to gravity-corrected quaternion
+                    // Q_limb = calibrationPacket * Q_streaming_corrected
+                    const globalQuat = new THREE.Quaternion();
+                    globalQuat.multiplyQuaternions(calibrationRotations[sourceId], Q_streaming_corrected);
+                    globalQuat.normalize();
+                    
+                    // Convert global quaternion to local space using PRE-CAPTURED parent orientation
+                    // if (bone.parent && bone.parent.isBone && parentWorldQuats[sourceId]) {
+                    //     const parentInverse = parentWorldQuats[sourceId].clone().invert();
+                    //     const localQuat = new THREE.Quaternion();
+                    //     localQuat.multiplyQuaternions(parentInverse, globalQuat);
+                    //     localQuat.normalize();
+                    //     bone.quaternion.copy(localQuat);
+                    // } else {
+                        // Root bone, use global quaternion directly
+                        // globalQuat.normalize();
+                        bone.quaternion.copy(globalQuat);
+                    // }
+                    
+                    appliedCount++;
+                });
+                
+                // Minimal logging - every 10 seconds
+                if (frameData.timestamp % 10000 < 50) {
+                    const fps = lastFrameTime > 0 ? 1000 / (frameData.timestamp - lastFrameTime) : 0;
+                    console.log(`Motion: ${appliedCount}/${appliedCount + skippedCount} bones, ~${fps.toFixed(1)} FPS`);
+                }
+                
+                lastFrameTime = frameData.timestamp;
+                
+                // Notify Android of successful frame render
+                if (typeof window.AndroidBridge !== 'undefined' && frameData.timestamp) {
+                    window.AndroidBridge.onFrameRendered(frameData.timestamp, clock.getDelta() > 0 ? 1.0 / clock.getDelta() : 60);
+                }
+            } catch (error) {
+                console.error('Motion frame error:', error);
+                if (typeof window.AndroidBridge !== 'undefined') {
+                    window.AndroidBridge.onError('motion_frame', error.message);
+                }
+            } finally {
+                frameProcessing = false;
+            }
+        };
+
+        init();
+        animate();
+
+        function init() {
+            clock = new THREE.Clock();
+
+            // Scene
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0xe0e0e0);
+            scene.fog = new THREE.Fog(0xe0e0e0, 200, 1000);
+
+            // Camera - adjusted FOV for mobile screens
+            const aspect = window.innerWidth / window.innerHeight;
+            // Use wider FOV for portrait mode to show full model
+            const fov = aspect < 1 ? 60 : 45;
+            camera = new THREE.PerspectiveCamera(fov, aspect, 1, 2000);
+            camera.position.set(0, 100, 400);
+            camera.lookAt(0, 50, 0);
+
+            // Lights
+            const hemiLight = new THREE.HemisphereLight(0xffffff, 0x444444, 2);
+            hemiLight.position.set(0, 200, 0);
+            scene.add(hemiLight);
+
+            const dirLight = new THREE.DirectionalLight(0xffffff, 1);
+            dirLight.position.set(100, 200, 100);
+            dirLight.castShadow = true;
+            dirLight.shadow.camera.top = 180;
+            dirLight.shadow.camera.bottom = -100;
+            dirLight.shadow.camera.left = -120;
+            dirLight.shadow.camera.right = 120;
+            scene.add(dirLight);
+
+            // Ground
+            const groundGeometry = new THREE.PlaneGeometry(2000, 2000);
+            const groundMaterial = new THREE.MeshPhongMaterial({ color: 0xcccccc, depthWrite: false });
+            const ground = new THREE.Mesh(groundGeometry, groundMaterial);
+            ground.rotation.x = -Math.PI / 2;
+            ground.receiveShadow = true;
+            scene.add(ground);
+
+            const grid = new THREE.GridHelper(2000, 40, 0x999999, 0xbbbbbb);
+            grid.material.opacity = 0.5;
+            grid.material.transparent = true;
+            scene.add(grid);
+
+            // Renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.shadowMap.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            // Controls
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.target.set(0, 50, 0);
+            controls.minDistance = 50;
+            controls.maxDistance = 500;
+            controls.update();
+            
+            // Force initial resize to ensure proper sizing
+            setTimeout(() => onWindowResize(), 100);
+
+            // Load GLB Model using Android interface
+            const loader = new GLTFLoader();
+            
+            console.log('=== STARTING MODEL LOAD ===');
+            console.log('AndroidBridge available:', typeof window.AndroidBridge !== 'undefined');
+            console.log('AndroidBridge methods:', window.AndroidBridge ? Object.keys(window.AndroidBridge) : 'N/A');
+            
+            try {
+                // Check if AndroidBridge is available (must access via window in modules)
+                if (typeof window.AndroidBridge === 'undefined') {
+                    throw new Error('AndroidBridge not available on window object');
+                }
+                
+                console.log('Calling window.AndroidBridge.loadGLB()...');
+                
+                // Get base64 encoded GLB data from Android (access via window)
+                const base64Data = window.AndroidBridge.loadGLB();
+                
+                console.log('GLB data received, length:', base64Data ? base64Data.length : 0);
+                
+                if (!base64Data) {
+                    throw new Error('Failed to load GLB data from Android - empty response');
+                }
+                
+                console.log('Converting base64 to ArrayBuffer...');
+                
+                // Convert base64 to ArrayBuffer
+                const binaryString = atob(base64Data);
+                const bytes = new Uint8Array(binaryString.length);
+                for (let i = 0; i < binaryString.length; i++) {
+                    bytes[i] = binaryString.charCodeAt(i);
+                }
+                
+                console.log('ArrayBuffer created, size:', bytes.length, 'bytes');
+                console.log('Parsing GLB with GLTFLoader...');
+                
+                // Parse the GLB data
+                loader.parse(bytes.buffer, '', function(gltf) {
+                    console.log('✓ GLB parsed successfully!');
+                    console.log('Scene:', gltf.scene);
+                    console.log('Animations:', gltf.animations.length);
+                    
+                    const object = gltf.scene;
+                    
+                    // Store reference to model
+                    ybotModel = object;
+                    
+                    console.log('Model stored, traversing for meshes...');
+                
+                    // Enable shadows for all meshes in the model
+                    object.traverse(function (child) {
+                        if (child.isMesh) {
+                            child.castShadow = true;
+                            child.receiveShadow = true;
+                            console.log('Found mesh:', child.name);
+                        }
+                    });
+
+                    // NOTE: Do NOT play animations - we control bones manually
+                    // Disable mixer to prevent animation conflicts
+                    mixer = null;
+
+                    console.log('Calculating model bounds...');
+
+                    // Center and scale the model
+                    const box = new THREE.Box3().setFromObject(object);
+                    const size = box.getSize(new THREE.Vector3());
+                    const center = box.getCenter(new THREE.Vector3());
+                    
+                    console.log('Original Size:', size);
+                    console.log('Original Center:', center);
+
+                    // Scale to fit nicely in view
+                    const maxDim = Math.max(size.x, size.y, size.z);
+                    const scale = 150 / maxDim;
+                    object.scale.setScalar(scale);
+                    
+                    console.log('Scale factor:', scale);
+                    
+                    // Recalculate bounding box after scaling
+                    const scaledBox = new THREE.Box3().setFromObject(object);
+                    const scaledCenter = scaledBox.getCenter(new THREE.Vector3());
+                    const scaledSize = scaledBox.getSize(new THREE.Vector3());
+                    
+                    console.log('Scaled Center:', scaledCenter);
+                    console.log('Scaled Size:', scaledSize);
+                    
+                    // Center the model at origin (0, 0, 0)
+                    object.position.x = -scaledCenter.x;
+                    object.position.y = -scaledCenter.y;
+                    object.position.z = -scaledCenter.z;
+                    
+                    console.log('Model Position after centering:', object.position);
+                    
+                    // Calculate model height and lift it above the ground
+                    const modelHeight = scaledSize.y;
+                    object.position.y += modelHeight * 0.50;
+                    
+                    console.log('Final Model Position:', object.position);
+                    console.log('Adding model to scene...');
+                    
+                    scene.add(object);
+                    
+                    console.log('Model added to scene! Scene children:', scene.children.length);
+                    
+                    // CRITICAL: Extract skeleton BEFORE rotating the model
+                    // This ensures bindPoseGlobal is captured in model's local space
+                    const skeletonReady = extractSkeleton();
+                    
+                    // NOW rotate model to face the camera (after skeleton extraction)
+                    // Rotate model to face the camera (camera is on +Z axis looking at origin)
+                    // Try different rotations if model doesn't face correctly:
+                    // 0° = object.rotation.y = 0
+                    // 90° = object.rotation.y = Math.PI / 2
+                    // 180° = object.rotation.y = Math.PI
+                    // 270° = object.rotation.y = -Math.PI / 2
+                    object.rotation.y = -30 * Math.PI / 180; // 150 degrees
+                    
+                    console.log('Model rotation set to:', (object.rotation.y * 180 / Math.PI).toFixed(1) + '°');
+                    console.log('Use rotateModel(degrees) in console to adjust, e.g., rotateModel(90)');
+                    
+                    // Responsive camera positioning based on screen aspect ratio
+                    const aspect = window.innerWidth / window.innerHeight;
+                    const hipHeight = modelHeight * 0.50 + (modelHeight * 0.35); // Hips are around 35% from bottom
+                    
+                    // Adjust camera distance based on aspect ratio
+                    // Portrait mode (aspect < 1) needs camera further back to show full model
+                    const cameraDistance = aspect < 1 ? modelHeight * 3.5 : modelHeight * 3;
+                    
+                    camera.position.set(0, hipHeight, cameraDistance);
+                    camera.lookAt(0, hipHeight, 0);
+                    controls.target.set(0, hipHeight, 0);
+                    controls.update();
+                    
+                    console.log('Camera position:', camera.position);
+                    console.log('Aspect ratio:', aspect);
+                    
+                    // Notify Android
+                    if (skeletonReady && typeof window.AndroidBridge !== 'undefined') {
+                        window.AndroidBridge.onModelLoaded(true);
+                    } else if (!skeletonReady && typeof window.AndroidBridge !== 'undefined') {
+                        window.AndroidBridge.onModelLoaded(false);
+                    }
+                }, 
+                undefined, // onProgress callback (not used)
+                function(error) {
+                    // onError callback
+                    console.error('GLB Loading Error:', error);
+                    if (typeof window.AndroidBridge !== 'undefined') {
+                        window.AndroidBridge.onError('model_loading', error.message);
+                        window.AndroidBridge.onModelLoaded(false);
+                    }
+                });
+                
+            } catch (error) {
+                console.error('GLB Loading Error:', error);
+                if (typeof window.AndroidBridge !== 'undefined') {
+                    window.AndroidBridge.onError('model_loading', error.message);
+                    window.AndroidBridge.onModelLoaded(false);
+                }
+            }
+
+            window.addEventListener('resize', onWindowResize);
+        }
+
+        function onWindowResize() {
+            const aspect = window.innerWidth / window.innerHeight;
+            
+            // Adjust FOV based on aspect ratio for better mobile viewing
+            camera.fov = aspect < 1 ? 60 : 45;
+            camera.aspect = aspect;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            const delta = clock.getDelta();
+            
+            // NOTE: Mixer disabled - bones controlled by motion capture data
+            // No need to update animations
+            
+            controls.update();
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+</html>
